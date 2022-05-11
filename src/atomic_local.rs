@@ -259,7 +259,7 @@ impl Writer {
     pub fn reserve(&mut self, len: usize) -> Option<WritableSlice<'_>> {
         let write = self.write;
         let mut read = self.read;
-        let to = unsafe { write.add(len) };
+        let to = write.wrapping_add(len);
         if read <= write {
             if to < self.inner.buf_end {
                 return Some(WritableSlice::new(write, to, None, self));

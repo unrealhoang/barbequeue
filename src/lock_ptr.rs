@@ -1,9 +1,12 @@
-use std::{sync::{Mutex, Arc, MutexGuard}, ops::Range};
+use std::{
+    ops::Range,
+    sync::{Arc, Mutex},
+};
 
-use crate::{SpscQueue, QueueReader, ReadSlice, QueueWriter, WriteSlice};
+use crate::{QueueReader, QueueWriter, ReadSlice, SpscQueue, WriteSlice};
 
-pub struct Locking;
-impl SpscQueue for Locking {
+pub struct LockingPtr;
+impl SpscQueue for LockingPtr {
     type Reader = Reader;
     type Writer = Writer;
 
@@ -11,6 +14,9 @@ impl SpscQueue for Locking {
         with_len(len)
     }
 }
+
+unsafe impl Send for Reader {}
+unsafe impl Send for Writer {}
 impl QueueReader for Reader {
     type ReadSlice<'a> = ReadableSlice<'a>;
 
@@ -39,41 +45,56 @@ impl<'a> WriteSlice for WritableSlice<'a> {
     }
 }
 
-struct BipBuf {
-    owned: Box<[u8]>,
-    /// owning ptr to underlying buf
+struct BufPtrs {
     read: usize,
     write: usize,
     last: usize,
 }
 
+struct BipBuf {
+    owned: Box<[u8]>,
+    len: usize,
+    buf: *mut u8,
+    ptrs: Mutex<BufPtrs>,
+}
+
 impl BipBuf {
     fn from_box(mut s: Box<[u8]>) -> Self {
-        Self {
-            owned: s,
+        let buf = s.as_mut_ptr();
+        let len = s.len();
+        let ptrs = Mutex::new(BufPtrs {
             read: 0,
             write: 0,
             last: 0,
+        });
+
+        Self {
+            owned: s,
+            len,
+            buf,
+            ptrs,
         }
     }
 }
 
 pub struct Reader {
-    inner: Arc<Mutex<BipBuf>>,
+    inner: Arc<BipBuf>,
 }
 
 pub struct Writer {
-    inner: Arc<Mutex<BipBuf>>,
+    inner: Arc<BipBuf>,
 }
 
 pub struct ReadableSlice<'a> {
-    unlocked: MutexGuard<'a, BipBuf>,
+    reader: &'a mut Reader,
     range: Range<usize>,
 }
 
 impl<'a> AsRef<[u8]> for ReadableSlice<'a> {
     fn as_ref(&self) -> &[u8] {
-        &self.unlocked.owned[self.range.clone()]
+        let slice_len = self.range.end - self.range.start;
+        let start_ptr = self.reader.inner.buf.wrapping_add(self.range.start);
+        unsafe { std::slice::from_raw_parts(start_ptr, slice_len) }
     }
 }
 
@@ -82,31 +103,35 @@ impl ReadableSlice<'_> {
         if len > self.range.end - self.range.start {
             panic!("commit read larger than readable range");
         }
-        self.unlocked.read = self.range.start + len;
+        let mut lock = self.reader.inner.ptrs.lock().unwrap();
+        lock.read = self.range.start + len;
     }
 }
 
 impl Reader {
     fn readable(&mut self) -> ReadableSlice<'_> {
-        let inner = self.inner.lock().unwrap();
-        if inner.read <= inner.write {
-            let range = inner.read..inner.write;
+        let lock = self.inner.ptrs.lock().unwrap();
+        if lock.read <= lock.write {
+            let range = lock.read..lock.write;
+            drop(lock);
             ReadableSlice {
-                unlocked: inner,
+                reader: self,
                 range,
             }
         } else {
             // read > write -> wrapped around, readable from read to last
-            if inner.read == inner.last {
-                let range = 0..inner.write;
+            if lock.read == lock.last {
+                let range = 0..lock.write;
+                drop(lock);
                 ReadableSlice {
-                    unlocked: inner,
+                    reader: self,
                     range,
                 }
             } else {
-                let range = inner.read..inner.last;
+                let range = lock.read..lock.last;
+                drop(lock);
                 ReadableSlice {
-                    unlocked: inner,
+                    reader: self,
                     range,
                 }
             }
@@ -115,34 +140,37 @@ impl Reader {
 }
 
 pub struct WritableSlice<'a> {
-    unlocked: MutexGuard<'a, BipBuf>,
+    writer: &'a mut Writer,
     range: Range<usize>,
     watermark: Option<usize>,
 }
 
 impl Writer {
     fn reserve(&mut self, len: usize) -> Option<WritableSlice<'_>> {
-        let inner = self.inner.lock().unwrap();
-        if len > inner.owned.len() / 2 {
+        let lock = self.inner.ptrs.lock().unwrap();
+        let buf_len = self.inner.len;
+        if len > buf_len / 2 {
             panic!("reserve len is larger than half of buffer len");
         }
-        if inner.read <= inner.write {
-            if inner.write + len < inner.owned.len() {
-                let range = inner.write..inner.write+len;
+        if lock.read <= lock.write {
+            if lock.write + len < buf_len {
+                let range = lock.write..lock.write + len;
                 let watermark = None;
+                drop(lock);
                 Some(WritableSlice {
-                    unlocked: inner,
                     range,
                     watermark,
+                    writer: self,
                 })
             } else {
-                if len < inner.read {
+                if len < lock.read {
                     let range = 0..len;
-                    let watermark = Some(inner.write);
+                    let watermark = Some(lock.write);
+                    drop(lock);
                     Some(WritableSlice {
-                        unlocked: inner,
                         range,
                         watermark,
+                        writer: self,
                     })
                 } else {
                     None
@@ -150,13 +178,14 @@ impl Writer {
             }
         } else {
             // write is before read
-            if inner.write + len < inner.read {
-                let range = inner.write..inner.write+len;
+            if lock.write + len < lock.read {
+                let range = lock.write..lock.write + len;
                 let watermark = None;
+                drop(lock);
                 Some(WritableSlice {
-                    unlocked: inner,
                     range,
                     watermark,
+                    writer: self,
                 })
             } else {
                 None
@@ -166,37 +195,31 @@ impl Writer {
 }
 
 impl WritableSlice<'_> {
-    fn commit_write(mut self, len: usize) {
+    fn commit_write(self, len: usize) {
         if len > self.range.end - self.range.start {
             panic!("commit write range larger than reserved");
         }
-        self.unlocked.write = self.range.start + len;
+        let mut lock = self.writer.inner.ptrs.lock().unwrap();
+        lock.write = self.range.start + len;
         if let Some(last) = self.watermark {
-            self.unlocked.last = last;
+            lock.last = last;
         }
     }
 }
 
 impl AsMut<[u8]> for WritableSlice<'_> {
     fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.unlocked.owned[self.range.clone()]
+        let slice_len = self.range.end - self.range.start;
+        let start_ptr = self.writer.inner.buf.wrapping_add(self.range.start);
+        unsafe { std::slice::from_raw_parts_mut(start_ptr, slice_len) }
     }
 }
 
 pub fn with_len(len: usize) -> (Reader, Writer) {
     let owned = vec![0; len].into_boxed_slice();
-    let buf = Arc::new(Mutex::new(BipBuf {
-        owned,
-        read: 0,
-        write: 0,
-        last: 0,
-    }));
-    let reader = Reader {
-        inner: buf.clone(),
-    };
-    let writer = Writer {
-        inner: buf,
-    };
+    let buf = Arc::new(BipBuf::from_box(owned));
+    let reader = Reader { inner: buf.clone() };
+    let writer = Writer { inner: buf };
 
     (reader, writer)
 }
