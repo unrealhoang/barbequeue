@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use cache_padded::CachePadded;
+use crossbeam::utils::CachePadded;
 
 use crate::{QueueReader, QueueWriter, ReadSlice, SpscQueue, WriteSlice};
 

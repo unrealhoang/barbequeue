@@ -6,5 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-cache-padded = "1.2"
 crossbeam = "0.8"
+
+[dev-dependencies]
+criterion = "0.3"
+
+[[bench]]
+name = "bbq_read_write"
+harness = false
